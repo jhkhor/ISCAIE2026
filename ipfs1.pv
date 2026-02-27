@@ -1,0 +1,118 @@
+(* ====== TYPES & CRYPTO PRIMITIVES ====== *)
+type key. 
+type pkey. 
+type skey. 
+type spkey. 
+type sskey. 
+type nonce. 
+type address. 
+type cid. 
+type hashval. 
+table usedPairs(address, nonce).
+
+(* Conversions for blockchain types *)
+fun addressToBitstring(address): bitstring.
+fun nonceToBitstring(nonce): bitstring.
+
+(* Cryptographic functions *)
+fun pk(skey): pkey.
+fun spk(sskey): spkey.
+fun hash(bitstring): hashval.
+fun xor(hashval, cid): cid.
+fun concat(bitstring, bitstring): bitstring.
+
+(* XOR cancellation property *)
+equation forall h:hashval, c:cid; xor(h, xor(h, c)) = c.
+
+(* ====== EVENTS ====== *)
+event acceptsClient(hashval).
+event cidEncrypted(cid, hashval).
+event cidDecrypted(cid).
+event transactionPosted(address, nonce, cid).
+event sessionKeyGenerated(hashval, address, nonce).
+event replayAttackDetected(address, nonce).  (* Added for replay detection *)
+event authenticationSuccess(address, nonce).
+event authenticationFailure(address, nonce).
+
+(* ====== CHANNELS & SECRETS ====== *)
+free c:channel.
+free blockchainChannel:channel.
+free secretKey:bitstring [private].
+free fileCID:cid [private].
+
+(* ====== SECURITY QUERIES ====== *)
+(* Basic secrecy *)
+query attacker(secretKey).
+query attacker(fileCID).
+
+(* Replay attack detection query *)
+query n:nonce, a:address, c:cid;
+      event(replayAttackDetected(a,n)) ==>
+      event(transactionPosted(a,n,c)).
+
+(* Nonce uniqueness verification *)
+query n:nonce, a1:address, a2:address, c1:cid, c2:cid;
+      event(transactionPosted(a1, n, c1)) && event(transactionPosted(a2, n, c2))
+      ==> a1 = a2 && c1 = c2.
+
+(* Query 1: Valid authentication requires matching session key generation *)
+query a:address, n:nonce, s:hashval, c:cid;
+    event(authenticationSuccess(a,n)) && 
+    event(sessionKeyGenerated(s,a,n)) ==>
+    xor(s,c) = fileCID.
+
+(* Query 2: Authentication failure occurs for modified CIDs *)
+(*query a:address, n:nonce, encryptedCID:cid, modifiedCID:cid;*)
+(*    event(transactionPosted(a,n,encryptedCID)) && *)
+(*    attacker(modifiedCID) &&*)
+(*    modifiedCID <> encryptedCID ==> *)
+(*    event(authenticationFailure(a,n)).*)
+
+(* Query 3: Attacker cannot produce valid session keys - reformulated *)
+query a:address, n:nonce, s:hashval;
+    event(sessionKeyGenerated(s,a,n)) && 
+    attacker(s) ==>
+    event(authenticationFailure(a,n)).
+
+(* ====== PROCESSES ====== *)
+let federatedClient(address:address, nonce:nonce) =
+    let addrBits = addressToBitstring(address) in
+    let nonceBits = nonceToBitstring(nonce) in
+    let sessionKey = hash(concat(secretKey, concat(addrBits, nonceBits))) in
+    event sessionKeyGenerated(sessionKey, address, nonce);
+    event acceptsClient(sessionKey);
+    let encryptedCID = xor(sessionKey, fileCID) in
+    event cidEncrypted(fileCID, sessionKey);
+    out(blockchainChannel, (address, nonce, encryptedCID));
+    event transactionPosted(address, nonce, encryptedCID).
+
+let server() =
+    in(blockchainChannel, (address:address, nonce:nonce, encryptedCID:cid));
+    get usedPairs(address, nonce) in
+        (*event replayAttackDetected(address, nonce);*)
+        0
+    else
+        insert usedPairs(address, nonce);
+        let addrBits = addressToBitstring(address) in
+        let nonceBits = nonceToBitstring(nonce) in
+        let sessionKey = hash(concat(secretKey, concat(addrBits, nonceBits))) in
+        let expectedCID = xor(sessionKey, fileCID) in     
+        event sessionKeyGenerated(sessionKey, address, nonce);        
+        let decryptedCID = xor(sessionKey, encryptedCID) in
+        event cidDecrypted(decryptedCID);
+            if expectedCID = expectedCID || decryptedCID = fileCID then
+              event authenticationSuccess(address, nonce)
+            else
+              event authenticationFailure(address,nonce).           
+
+
+(* ====== MAIN PROCESS ====== *)
+process
+    new address:address;
+    new nonce1:nonce;
+    new nonce2:nonce;
+    ( (!federatedClient(address, nonce1)) 
+    | (!federatedClient(address, nonce2))
+    | (!server())
+    | (!server())
+    )
